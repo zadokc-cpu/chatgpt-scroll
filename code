@@ -1,538 +1,611 @@
-
- // ==UserScript==
- // @name         ChatGPT Manual Auto Copy + Floating Power
- // @namespace    https://tampermonkey.net/
- // @version      6.0
- // @description  Manually scan the current ChatGPT conversation and click Copy on each code block.
- // @match        https://chatgpt.com/*
- // @match        https://chat.openai.com/*
- // @run-at       document-idle
- // @grant        none
- // ==/UserScript==
-
- (() => {
-   'use strict';
-
-   // Prevent duplicate buttons if the script is initialized more than once.
-   if (window.__chatGPTManualAutoCopyV6) return;
-   window.__chatGPTManualAutoCopyV6 = true;
-
-   const PREFIX = '[Auto Copy]';
-   const COPY_DELAY = 1000;
-   const SCROLL_DELAY = 350;
-
-   let active = false;
-   let busy = false;
-   let cancelRequested = false;
-
-   let button;
-   let status;
-   let panel;
-
-   // ------------------------------------------------------------
-   // Floating, draggable power button and status display
-   // ------------------------------------------------------------
-
-   function createControls() {
-     if (document.getElementById('cgpt-auto-copy-power')) return;
-
-     panel = document.createElement('div');
-     panel.id = 'cgpt-auto-copy-panel';
-
-     Object.assign(panel.style, {
-       position: 'fixed',
-       right: '24px',
-       bottom: '110px',
-       zIndex: '2147483647',
-       display: 'flex',
-       flexDirection: 'column',
-       alignItems: 'flex-end',
-       gap: '8px',
-       fontFamily: 'system-ui, sans-serif',
-       pointerEvents: 'none'
-     });
-
-     status = document.createElement('div');
-     Object.assign(status.style, {
-       maxWidth: '300px',
-       padding: '8px 11px',
-       borderRadius: '9px',
-       background: '#18181b',
-       color: '#fff',
-       fontSize: '12px',
-       lineHeight: '1.4',
-       boxShadow: '0 3px 12px #0005',
-       overflowWrap: 'anywhere',
-       display: 'none',
-       pointerEvents: 'none'
-     });
-     status.textContent = 'Auto Copy: OFF';
-
-     button = document.createElement('button');
-     button.id = 'cgpt-auto-copy-power';
-     button.type = 'button';
-     button.title = 'Auto Copy OFF — click to scan this conversation';
-     button.setAttribute('aria-label', 'Auto Copy power button');
-     button.innerHTML = `
-       <svg width="28" height="28" viewBox="0 0 24 24"
-            fill="none" stroke="currentColor" stroke-width="2.5"
-            stroke-linecap="round" stroke-linejoin="round"
-            aria-hidden="true">
-         <path d="M12 2v10"></path>
-         <path d="M6.2 5.8a8 8 0 1 0 11.6 0"></path>
-       </svg>
-     `;
-
-     Object.assign(button.style, {
-       width: '58px',
-       height: '58px',
-       border: '2px solid #fff',
-       borderRadius: '50%',
-       background: '#dc2626',
-       color: '#fff',
-       display: 'flex',
-       alignItems: 'center',
-       justifyContent: 'center',
-       cursor: 'grab',
-       padding: '0',
-       boxShadow: '0 4px 16px #0005',
-       touchAction: 'none',
-       pointerEvents: 'auto',
-       userSelect: 'none'
-     });
-
-     panel.append(status, button);
-     document.body.appendChild(panel);
-
-     let startX = 0;
-     let startY = 0;
-     let startLeft = 0;
-     let startTop = 0;
-     let dragged = false;
-     let pointerId = null;
-
-     button.addEventListener('pointerdown', event => {
-       if (event.button !== 0 && event.pointerType !== 'touch') return;
-
-       const rect = panel.getBoundingClientRect();
-
-       startX = event.clientX;
-       startY = event.clientY;
-       startLeft = rect.left;
-       startTop = rect.top;
-       dragged = false;
-       pointerId = event.pointerId;
-
-       button.setPointerCapture(event.pointerId);
-       button.style.cursor = 'grabbing';
-       event.preventDefault();
-     });
-
-     button.addEventListener('pointermove', event => {
-       if (pointerId !== event.pointerId) return;
-
-       const dx = event.clientX - startX;
-       const dy = event.clientY - startY;
-
-       if (!dragged && Math.hypot(dx, dy) > 6) dragged = true;
-       if (!dragged) return;
-
-       const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
-       const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
-
-       panel.style.left = `${Math.min(maxLeft, Math.max(0, startLeft + dx))}px`;
-       panel.style.top = `${Math.min(maxTop, Math.max(0, startTop + dy))}px`;
-       panel.style.right = 'auto';
-       panel.style.bottom = 'auto';
-     });
-
-     button.addEventListener('pointerup', event => {
-       if (pointerId !== event.pointerId) return;
-
-       pointerId = null;
-       button.style.cursor = 'grab';
-
-       if (dragged) {
-         // A drag should not accidentally start or stop copying.
-         suppressNextClick = true;
-       }
-     });
-
-     button.addEventListener('pointercancel', () => {
-       pointerId = null;
-       button.style.cursor = 'grab';
-     });
-
-     let suppressNextClick = false;
-
-     button.addEventListener('click', () => {
-       if (suppressNextClick) {
-         suppressNextClick = false;
-         return;
-       }
-
-       if (active) {
-         active = false;
-         cancelRequested = true;
-         updatePowerButton();
-         setStatus('Auto Copy OFF — processing will stop after the current action.');
-         console.log(PREFIX, 'Stopped by user.');
-         return;
-       }
-
-       active = true;
-       cancelRequested = false;
-       updatePowerButton();
-
-       // Always scan the current page, including older conversations.
-       scanAndProcess();
-     });
-
-     window.addEventListener('resize', () => {
-       const rect = panel.getBoundingClientRect();
-
-       panel.style.left = `${Math.max(
-         0, Math.min(rect.left, window.innerWidth - panel.offsetWidth)
-       )}px`;
-
-       panel.style.top = `${Math.max(
-         0, Math.min(rect.top, window.innerHeight - panel.offsetHeight)
-       )}px`;
-
-       panel.style.right = 'auto';
-       panel.style.bottom = 'auto';
-     });
-
-     updatePowerButton();
-   }
-
-   function updatePowerButton() {
-     if (!button) return;
-
-     button.style.background = active ? '#16a34a' : '#dc2626';
-     button.title = active
-       ? 'Auto Copy ON — click to stop'
-       : 'Auto Copy OFF — click to scan this conversation';
-
-     button.setAttribute(
-       'aria-label',
-       active ? 'Auto Copy ON, click to stop' : 'Auto Copy OFF, click to start'
-     );
-   }
-
-   function setStatus(message) {
-     if (!status) return;
-
-     status.textContent = message;
-     status.style.display = 'block';
-     console.log(PREFIX, message);
-   }
-
-   function wait(ms) {
-     return new Promise(resolve => setTimeout(resolve, ms));
-   }
-
-   // ------------------------------------------------------------
-   // Discover ChatGPT code-style blocks already on the page
-   // ------------------------------------------------------------
-
-   function getBlockText(block) {
-     const source = block.matches('[data-code-block="true"]')
-       ? block.querySelector('[data-code-block-source="true"]')
-       : null;
-
-     const pre = block.matches('pre') ? block : block.querySelector('pre');
-
-     const content = source || pre || block;
-
-     return (content.innerText || content.textContent || '').trim();
-   }
-
-   function isVisible(element) {
-     if (!element || !element.isConnected) return false;
-
-     const rect = element.getBoundingClientRect();
-     const style = window.getComputedStyle(element);
-
-     return rect.width > 0 &&
-       rect.height > 0 &&
-       style.display !== 'none' &&
-       style.visibility !== 'hidden';
-   }
-
-   function getCopyButton(block) {
-     // Prefer the Copy button in the specific code-block container.
-     const directContainer = block.matches('[data-code-block="true"]')
-       ? block
-       : block.closest('[data-code-block="true"]');
-
-     if (directContainer) {
-       const directButtons = [
-         ...directContainer.querySelectorAll('button')
-       ];
-
-       const directCopy = directButtons.find(button => {
-         const label = [
-           button.getAttribute('aria-label'),
-           button.getAttribute('title'),
-           button.getAttribute('data-testid'),
-           button.innerText
-         ].filter(Boolean).join(' ').toLowerCase();
-
-         return isVisible(button) &&
-           (/copy\s*code|copy-code|copy code button/.test(label) ||
-            label.trim() === 'copy');
-       });
-
-       if (directCopy) return directCopy;
-     }
-
-     // Fallback for conventional <pre><code> blocks.
-     // Search progressively larger ancestors, nearest first.
-     let node = block;
-
-     for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
-       const candidates = [...node.querySelectorAll('button')];
-
-       const copyButton = candidates.find(button => {
-         const label = [
-           button.getAttribute('aria-label'),
-           button.getAttribute('title'),
-           button.getAttribute('data-testid'),
-           button.innerText
-         ].filter(Boolean).join(' ').toLowerCase();
-
-         return isVisible(button) &&
-           (/copy\s*code|copy-code|copy code button/.test(label) ||
-            label.trim() === 'copy');
-       });
-
-       if (copyButton) return copyButton;
-     }
-
-     return null;
-   }
-
-   function findBlocks() {
-     const blocks = [];
-     const seen = new Set();
-
-     // This matches the structure seen in the supplied diagnostics.
-     // It includes JSON and Plain text blocks, not only <pre> elements.
-     document.querySelectorAll('[data-code-block="true"]').forEach(container => {
-       const text = getBlockText(container);
-       if (!text || !isVisible(container)) return;
-
-       const copyButton = getCopyButton(container);
-       if (!copyButton) return;
-
-       if (seen.has(container)) return;
-       seen.add(container);
-
-       blocks.push({
-         element: container,
-         text,
-         copyButton,
-         kind: 'ChatGPT code-style block'
-       });
-     });
-
-     // Conventional pre elements that are not already inside a discovered
-     // ChatGPT code-style container.
-     document.querySelectorAll('pre').forEach(pre => {
-       if (pre.closest('[data-code-block="true"]')) return;
-       if (!getBlockText(pre) || !isVisible(pre)) return;
-
-       const copyButton = getCopyButton(pre);
-       if (!copyButton) return;
-
-       const container = pre.closest('.CodeBlock-zu1QM3') || pre;
-
-       if (seen.has(container)) return;
-       seen.add(container);
-
-       blocks.push({
-         element: container,
-         text: getBlockText(pre),
-         copyButton,
-         kind: 'pre/code block'
-       });
-     });
-
-     // Process in visual/document order, from top to bottom.
-     blocks.sort((a, b) => {
-       const position = a.element.compareDocumentPosition(b.element);
-
-       if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-       if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-
-       return 0;
-     });
-
-     return blocks;
-   }
-
-   // ------------------------------------------------------------
-   // Visual feedback and sequential copying
-   // ------------------------------------------------------------
-
-   function scrollToBlock(element) {
-     element.scrollIntoView({
-       behavior: 'smooth',
-       block: 'center'
-     });
-
-     const oldOutline = element.style.outline;
-     const oldOffset = element.style.outlineOffset;
-     const oldTransition = element.style.transition;
-
-     element.style.transition = 'outline 0.2s ease';
-     element.style.outline = '3px solid #22c55e';
-     element.style.outlineOffset = '3px';
-
-     return () => {
-       element.style.outline = oldOutline;
-       element.style.outlineOffset = oldOffset;
-       element.style.transition = oldTransition;
-     };
-   }
-
-   async function scanAndProcess() {
-     if (busy) {
-       setStatus('Already processing. Wait for the current scan to finish.');
-       return;
-     }
-
-     busy = true;
-
-     try {
-       // Allow the UI to reflect the ON state before scanning.
-       await wait(100);
-
-       if (!active || cancelRequested) return;
-
-       const blocks = findBlocks();
-
-       console.log(PREFIX, 'Page URL:', location.href);
-       console.log(PREFIX, 'Blocks found:', blocks.length);
-
-       if (!blocks.length) {
-         setStatus(
-           'No eligible blocks found. Check the console for selector diagnostics.'
-         );
-         return;
-       }
-
-       setStatus(`Found ${blocks.length} block(s). Starting copy sequence...`);
-
-       let copied = 0;
-       let skipped = 0;
-
-       for (let i = 0; i < blocks.length; i++) {
-         if (!active || cancelRequested) break;
-
-         const block = blocks[i];
-         const preview = block.text.replace(/\s+/g, ' ').slice(0, 110);
-
-         setStatus(
-           `Block ${i + 1}/${blocks.length}: scrolling to "${preview}"`
-         );
-
-         console.log(PREFIX, `Block ${i + 1}/${blocks.length}`, {
-           kind: block.kind,
-           length: block.text.length,
-           preview,
-           element: block.element
-         });
-
-         const restoreOutline = scrollToBlock(block.element);
-
-         // Give the smooth scroll a moment so the user can see the action.
-         await wait(SCROLL_DELAY);
-
-         if (!active || cancelRequested) {
-           restoreOutline();
-           break;
-         }
-
-         // Re-resolve the button in case ChatGPT re-rendered the block.
-         const copyButton = getCopyButton(block.element) || block.copyButton;
-
-         if (!copyButton || !copyButton.isConnected || !isVisible(copyButton)) {
-           skipped++;
-           setStatus(
-             `Block ${i + 1}/${blocks.length}: Copy button not found. Skipping.`
-           );
-           console.warn(PREFIX, 'Copy button unavailable:', block.element);
-           restoreOutline();
-           await wait(COPY_DELAY);
-           continue;
-         }
-
-         setStatus(`Copying block ${i + 1}/${blocks.length}: "${preview}"`);
-
-         try {
-           copyButton.click();
-           copied++;
-
-           console.log(PREFIX, `Clicked Copy for block ${i + 1}`, {
-             preview,
-             textLength: block.text.length,
-             copyButton
-           });
-         } catch (error) {
-           skipped++;
-           console.error(PREFIX, 'Copy click failed:', error);
-         }
-
-         // Leave the outline briefly visible.
-         await wait(250);
-         restoreOutline();
-
-         // One full second between copy attempts.
-         await wait(COPY_DELAY);
-       }
-
-       if (!active || cancelRequested) {
-         setStatus(
-           `Stopped. Copy clicks attempted: ${copied}; skipped: ${skipped}.`
-         );
-       } else {
-         setStatus(
-           `Finished. Copy clicks attempted: ${copied}; skipped: ${skipped}.`
-         );
-       }
-
-       console.log(PREFIX, 'Scan finished:', {
-         total: blocks.length,
-         copyClicksAttempted: copied,
-         skipped,
-         stopped: !active || cancelRequested
-       });
-     } catch (error) {
-       console.error(PREFIX, 'Unexpected error:', error);
-       setStatus(`Error: ${error.message || String(error)}`);
-     } finally {
-       busy = false;
-     }
-   }
-
-   // ------------------------------------------------------------
-   // Start immediately on existing pages. No response watcher.
-   // ------------------------------------------------------------
-
-   function initialize() {
-     createControls();
-     console.log(
-       PREFIX,
-       'Script loaded. Click the red floating power button to scan this page.'
-     );
-   }
-
-   if (document.body) {
-     initialize();
-   } else {
-     document.addEventListener('DOMContentLoaded', initialize, { once: true });
-   }
-
- })();
+// ==UserScript==
+// @name         ChatGPT Manual Auto Copy + Floating Power
+// @namespace    https://tampermonkey.net/
+// @version      6.1
+// @description  Manually scan the current ChatGPT conversation and click Copy on each code block.
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  // Prevent duplicate initialization if the script is injected more than once.
+  if (window.__chatGPTManualAutoCopyV6) return;
+  window.__chatGPTManualAutoCopyV6 = true;
+
+  const PREFIX = '[Auto Copy]';
+  const COPY_DELAY = 1000;
+  const SCROLL_DELAY = 350;
+
+  let active = false;
+  let busy = false;
+  let cancelRequested = false;
+
+  let button;
+  let status;
+  let panel;
+
+  // Remembers where the user dragged the panel, so it survives re-creation.
+  let savedPos = null;
+  let resizeListenerAdded = false;
+
+  // ------------------------------------------------------------
+  // Floating, draggable power button and status display
+  // ------------------------------------------------------------
+
+  function createControls() {
+    if (document.getElementById('cgpt-auto-copy-panel')) return;
+
+    panel = document.createElement('div');
+    panel.id = 'cgpt-auto-copy-panel';
+
+    Object.assign(panel.style, {
+      position: 'fixed',
+      right: '24px',
+      bottom: '110px',
+      zIndex: '2147483647',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'flex-end',
+      gap: '8px',
+      fontFamily: 'system-ui, sans-serif',
+      pointerEvents: 'none'
+    });
+
+    // Restore the dragged position if the panel was re-created.
+    if (savedPos) {
+      panel.style.left = savedPos.left;
+      panel.style.top = savedPos.top;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    }
+
+    status = document.createElement('div');
+    Object.assign(status.style, {
+      maxWidth: '300px',
+      padding: '8px 11px',
+      borderRadius: '9px',
+      background: '#18181b',
+      color: '#fff',
+      fontSize: '12px',
+      lineHeight: '1.4',
+      boxShadow: '0 3px 12px #0005',
+      overflowWrap: 'anywhere',
+      display: 'none',
+      pointerEvents: 'none'
+    });
+    status.textContent = 'Auto Copy: OFF';
+
+    button = document.createElement('button');
+    button.id = 'cgpt-auto-copy-power';
+    button.type = 'button';
+    button.title = 'Auto Copy OFF — click to scan this conversation';
+    button.setAttribute('aria-label', 'Auto Copy power button');
+    button.innerHTML = `
+      <svg width="28" height="28" viewBox="0 0 24 24"
+           fill="none" stroke="currentColor" stroke-width="2.5"
+           stroke-linecap="round" stroke-linejoin="round"
+           aria-hidden="true">
+        <path d="M12 2v10"></path>
+        <path d="M6.2 5.8a8 8 0 1 0 11.6 0"></path>
+      </svg>
+    `;
+
+    Object.assign(button.style, {
+      width: '58px',
+      height: '58px',
+      border: '2px solid #fff',
+      borderRadius: '50%',
+      background: '#dc2626',
+      color: '#fff',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      cursor: 'grab',
+      padding: '0',
+      boxShadow: '0 4px 16px #0005',
+      touchAction: 'none',
+      pointerEvents: 'auto',
+      userSelect: 'none'
+    });
+
+    panel.append(status, button);
+    document.body.appendChild(panel);
+
+    let startX = 0;
+    let startY = 0;
+    let startLeft = 0;
+    let startTop = 0;
+    let dragged = false;
+    let pointerId = null;
+    let suppressNextClick = false;
+
+    button.addEventListener('pointerdown', event => {
+      if (event.button !== 0 && event.pointerType !== 'touch') return;
+
+      const rect = panel.getBoundingClientRect();
+
+      startX = event.clientX;
+      startY = event.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      dragged = false;
+      pointerId = event.pointerId;
+
+      button.setPointerCapture(event.pointerId);
+      button.style.cursor = 'grabbing';
+      event.preventDefault();
+    });
+
+    button.addEventListener('pointermove', event => {
+      if (pointerId !== event.pointerId) return;
+
+      const dx = event.clientX - startX;
+      const dy = event.clientY - startY;
+
+      if (!dragged && Math.hypot(dx, dy) > 6) dragged = true;
+      if (!dragged) return;
+
+      const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+      const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+
+      panel.style.left = `${Math.min(maxLeft, Math.max(0, startLeft + dx))}px`;
+      panel.style.top = `${Math.min(maxTop, Math.max(0, startTop + dy))}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    });
+
+    button.addEventListener('pointerup', event => {
+      if (pointerId !== event.pointerId) return;
+
+      pointerId = null;
+      button.style.cursor = 'grab';
+
+      if (dragged) {
+        // A drag should not accidentally start or stop copying.
+        suppressNextClick = true;
+        savedPos = { left: panel.style.left, top: panel.style.top };
+      }
+    });
+
+    button.addEventListener('pointercancel', () => {
+      pointerId = null;
+      button.style.cursor = 'grab';
+    });
+
+    button.addEventListener('click', () => {
+      if (suppressNextClick) {
+        suppressNextClick = false;
+        return;
+      }
+
+      if (active) {
+        active = false;
+        cancelRequested = true;
+        updatePowerButton();
+        setStatus('Auto Copy OFF — processing will stop after the current action.');
+        console.log(PREFIX, 'Stopped by user.');
+        return;
+      }
+
+      active = true;
+      cancelRequested = false;
+      updatePowerButton();
+
+      // Always scan the current page, including older conversations.
+      scanAndProcess();
+    });
+
+    // Register the resize handler only once, even if the panel is re-created.
+    if (!resizeListenerAdded) {
+      resizeListenerAdded = true;
+
+      window.addEventListener('resize', () => {
+        if (!panel || !panel.isConnected) return;
+
+        const rect = panel.getBoundingClientRect();
+
+        panel.style.left = `${Math.max(
+          0, Math.min(rect.left, window.innerWidth - panel.offsetWidth)
+        )}px`;
+
+        panel.style.top = `${Math.max(
+          0, Math.min(rect.top, window.innerHeight - panel.offsetHeight)
+        )}px`;
+
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+      });
+    }
+
+    // Restores the correct color if the panel is re-created while ON.
+    updatePowerButton();
+  }
+
+  function updatePowerButton() {
+    if (!button) return;
+
+    button.style.background = active ? '#16a34a' : '#dc2626';
+    button.title = active
+      ? 'Auto Copy ON — click to stop'
+      : 'Auto Copy OFF — click to scan this conversation';
+
+    button.setAttribute(
+      'aria-label',
+      active ? 'Auto Copy ON, click to stop' : 'Auto Copy OFF, click to start'
+    );
+  }
+
+  function setStatus(message) {
+    if (!status) return;
+
+    status.textContent = message;
+    status.style.display = 'block';
+    console.log(PREFIX, message);
+  }
+
+  function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // ------------------------------------------------------------
+  // Discover ChatGPT code-style blocks already on the page
+  // ------------------------------------------------------------
+
+  function getBlockText(block) {
+    const source = block.matches('[data-code-block="true"]')
+      ? block.querySelector('[data-code-block-source="true"]')
+      : null;
+
+    const pre = block.matches('pre') ? block : block.querySelector('pre');
+
+    const content = source || pre || block;
+
+    return (content.innerText || content.textContent || '').trim();
+  }
+
+  function isVisible(element) {
+    if (!element || !element.isConnected) return false;
+
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      style.display !== 'none' &&
+      style.visibility !== 'hidden';
+  }
+
+  function getCopyButton(block) {
+    // Prefer the Copy button in the specific code-block container.
+    const directContainer = block.matches('[data-code-block="true"]')
+      ? block
+      : block.closest('[data-code-block="true"]');
+
+    if (directContainer) {
+      const directButtons = [
+        ...directContainer.querySelectorAll('button')
+      ];
+
+      const directCopy = directButtons.find(button => {
+        const label = [
+          button.getAttribute('aria-label'),
+          button.getAttribute('title'),
+          button.getAttribute('data-testid'),
+          button.innerText
+        ].filter(Boolean).join(' ').toLowerCase();
+
+        return isVisible(button) &&
+          (/copy\s*code|copy-code|copy code button/.test(label) ||
+           label.trim() === 'copy');
+      });
+
+      if (directCopy) return directCopy;
+    }
+
+    // Fallback for conventional <pre><code> blocks.
+    // Search progressively larger ancestors, nearest first.
+    let node = block;
+
+    for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+      const candidates = [...node.querySelectorAll('button')];
+
+      const copyButton = candidates.find(button => {
+        const label = [
+          button.getAttribute('aria-label'),
+          button.getAttribute('title'),
+          button.getAttribute('data-testid'),
+          button.innerText
+        ].filter(Boolean).join(' ').toLowerCase();
+
+        return isVisible(button) &&
+          (/copy\s*code|copy-code|copy code button/.test(label) ||
+           label.trim() === 'copy');
+      });
+
+      if (copyButton) return copyButton;
+    }
+
+    return null;
+  }
+
+  function findBlocks() {
+    const blocks = [];
+    const seen = new Set();
+
+    // This matches the structure seen in the supplied diagnostics.
+    // It includes JSON and Plain text blocks, not only <pre> elements.
+    document.querySelectorAll('[data-code-block="true"]').forEach(container => {
+      const text = getBlockText(container);
+      if (!text || !isVisible(container)) return;
+
+      const copyButton = getCopyButton(container);
+      if (!copyButton) return;
+
+      if (seen.has(container)) return;
+      seen.add(container);
+
+      blocks.push({
+        element: container,
+        text,
+        copyButton,
+        kind: 'ChatGPT code-style block'
+      });
+    });
+
+    // Conventional pre elements that are not already inside a discovered
+    // ChatGPT code-style container.
+    document.querySelectorAll('pre').forEach(pre => {
+      if (pre.closest('[data-code-block="true"]')) return;
+      if (!getBlockText(pre) || !isVisible(pre)) return;
+
+      const copyButton = getCopyButton(pre);
+      if (!copyButton) return;
+
+      const container = pre.closest('.CodeBlock-zu1QM3') || pre;
+
+      if (seen.has(container)) return;
+      seen.add(container);
+
+      blocks.push({
+        element: container,
+        text: getBlockText(pre),
+        copyButton,
+        kind: 'pre/code block'
+      });
+    });
+
+    // Third pass: blocks that have a Copy button but no code-block markup
+    // (e.g. the "Writing" blocks).
+    const isCopyLabel = btn => [
+      btn.getAttribute('aria-label'),
+      btn.getAttribute('title'),
+      btn.innerText
+    ].some(s => {
+      const l = (s || '').trim().toLowerCase();
+      return l === 'copy' || l === 'copy code';
+    });
+
+    document.querySelectorAll('button').forEach(btn => {
+      if (!isVisible(btn) || !isCopyLabel(btn)) return;
+      if (btn.getAttribute('data-testid') === 'copy-turn-action-button') return; // whole-response copy
+      if (!btn.closest('[data-message-author-role="assistant"]')) return;       // assistant only
+      if (blocks.some(b => b.element.contains(btn))) return;                     // already handled
+
+      // Climb to the smallest ancestor that actually holds the block's text.
+      let container = btn.parentElement;
+      for (let i = 0; i < 6 && container; i++) {
+        if (container.hasAttribute('data-message-author-role')) break;
+        if ((container.innerText || '').trim().length > 40) break;
+        container = container.parentElement;
+      }
+      if (!container || seen.has(container)) return;
+      seen.add(container);
+
+      blocks.push({
+        element: container,
+        text: (container.innerText || '').trim(),
+        copyButton: btn,
+        kind: 'loose'
+      });
+    });
+
+    // Process in visual/document order, from top to bottom.
+    blocks.sort((a, b) => {
+      const position = a.element.compareDocumentPosition(b.element);
+
+      if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+
+      return 0;
+    });
+
+    return blocks;
+  }
+
+  // ------------------------------------------------------------
+  // Visual feedback and sequential copying
+  // ------------------------------------------------------------
+
+  function scrollToBlock(element) {
+    element.scrollIntoView({
+      behavior: 'smooth',
+      block: 'center'
+    });
+
+    const oldOutline = element.style.outline;
+    const oldOffset = element.style.outlineOffset;
+    const oldTransition = element.style.transition;
+
+    element.style.transition = 'outline 0.2s ease';
+    element.style.outline = '3px solid #22c55e';
+    element.style.outlineOffset = '3px';
+
+    return () => {
+      element.style.outline = oldOutline;
+      element.style.outlineOffset = oldOffset;
+      element.style.transition = oldTransition;
+    };
+  }
+
+  async function scanAndProcess() {
+    if (busy) {
+      setStatus('Already processing. Wait for the current scan to finish.');
+      return;
+    }
+
+    busy = true;
+
+    try {
+      // Allow the UI to reflect the ON state before scanning.
+      await wait(100);
+
+      if (!active || cancelRequested) return;
+
+      const blocks = findBlocks();
+
+      console.log(PREFIX, 'Page URL:', location.href);
+      console.log(PREFIX, 'Blocks found:', blocks.length);
+
+      if (!blocks.length) {
+        setStatus(
+          'No eligible blocks found. Check the console for selector diagnostics.'
+        );
+        return;
+      }
+
+      setStatus(`Found ${blocks.length} block(s). Starting copy sequence...`);
+
+      let copied = 0;
+      let skipped = 0;
+
+      for (let i = 0; i < blocks.length; i++) {
+        if (!active || cancelRequested) break;
+
+        const block = blocks[i];
+        const preview = block.text.replace(/\s+/g, ' ').slice(0, 110);
+
+        setStatus(
+          `Block ${i + 1}/${blocks.length}: scrolling to "${preview}"`
+        );
+
+        console.log(PREFIX, `Block ${i + 1}/${blocks.length}`, {
+          kind: block.kind,
+          length: block.text.length,
+          preview,
+          element: block.element
+        });
+
+        const restoreOutline = scrollToBlock(block.element);
+
+        // Give the smooth scroll a moment so the user can see the action.
+        await wait(SCROLL_DELAY);
+
+        if (!active || cancelRequested) {
+          restoreOutline();
+          break;
+        }
+
+        // Some UIs only render/enable the button on hover.
+        block.element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+
+        // Re-resolve the button in case ChatGPT re-rendered the block.
+        const copyButton = block.kind === 'loose'
+          ? block.copyButton
+          : (getCopyButton(block.element) || block.copyButton);
+
+        if (!copyButton || !copyButton.isConnected || !isVisible(copyButton)) {
+          skipped++;
+          setStatus(
+            `Block ${i + 1}/${blocks.length}: Copy button not found. Skipping.`
+          );
+          console.warn(PREFIX, 'Copy button unavailable:', block.element);
+          restoreOutline();
+          await wait(COPY_DELAY);
+          continue;
+        }
+
+        setStatus(`Copying block ${i + 1}/${blocks.length}: "${preview}"`);
+
+        try {
+          copyButton.click();
+          copied++;
+
+          console.log(PREFIX, `Clicked Copy for block ${i + 1}`, {
+            preview,
+            textLength: block.text.length,
+            copyButton
+          });
+        } catch (error) {
+          skipped++;
+          console.error(PREFIX, 'Copy click failed:', error);
+        }
+
+        // Leave the outline briefly visible.
+        await wait(250);
+        restoreOutline();
+
+        // One full second between copy attempts.
+        await wait(COPY_DELAY);
+      }
+
+      if (!active || cancelRequested) {
+        setStatus(
+          `Stopped. Copy clicks attempted: ${copied}; skipped: ${skipped}.`
+        );
+      } else {
+        setStatus(
+          `Finished. Copy clicks attempted: ${copied}; skipped: ${skipped}.`
+        );
+      }
+
+      console.log(PREFIX, 'Scan finished:', {
+        total: blocks.length,
+        copyClicksAttempted: copied,
+        skipped,
+        stopped: !active || cancelRequested
+      });
+    } catch (error) {
+      console.error(PREFIX, 'Unexpected error:', error);
+      setStatus(`Error: ${error.message || String(error)}`);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // ------------------------------------------------------------
+  // Initialization: keep the floating button alive across SPA re-renders
+  // ------------------------------------------------------------
+
+  function ensureControls() {
+    if (document.body && !document.getElementById('cgpt-auto-copy-panel')) {
+      createControls();
+    }
+  }
+
+  function initialize() {
+    ensureControls();
+
+    // Re-add the button if ChatGPT's re-render removes it.
+    new MutationObserver(ensureControls)
+      .observe(document.documentElement, { childList: true, subtree: true });
+
+    // Safety net in case the observer misses something.
+    setInterval(ensureControls, 1500);
+
+    console.log(
+      PREFIX,
+      'Script loaded. Click the red floating power button to scan this page.'
+    );
+  }
+
+  if (document.body) {
+    initialize();
+  } else {
+    document.addEventListener('DOMContentLoaded', initialize, { once: true });
+  }
+
+})();
